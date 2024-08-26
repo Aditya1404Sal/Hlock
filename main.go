@@ -140,6 +140,9 @@ func verifyOTPHandler(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
 		return
 	}
+	//clear the temp otp.
+	user.OTPKey = ""
+	db.Save(&user)
 
 	token := generateToken()
 	session := Session{UserID: user.ID, Token: token}
