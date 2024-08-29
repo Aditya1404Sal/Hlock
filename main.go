@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"
@@ -21,13 +23,14 @@ type User struct {
 	Phone    string
 	Password string
 	Role     string
-	OTPKey   string
+	TOTPKey  string
 }
 
 type Session struct {
 	gorm.Model
 	UserID uint
 	Token  string `gorm:"uniqueIndex"`
+	Expiry time.Time
 }
 
 type ActivityLog struct {
@@ -51,8 +54,8 @@ func main() {
 
 	r.POST("/register", registerHandler)
 	r.POST("/login", loginHandler)
-	r.POST("/logout", authMiddleware(), logoutHandler)
 	r.POST("/verify-otp", verifyOTPHandler)
+	r.POST("/logout", authMiddleware(), logoutHandler)
 	r.GET("/protected", authMiddleware(), protectedHandler)
 
 	r.Run(":8080")
@@ -65,7 +68,11 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
 	user.Password = string(hashedPassword)
 
 	if err := db.Create(&user).Error; err != nil {
@@ -73,7 +80,7 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "User created"})
+	c.JSON(http.StatusOK, gin.H{"message": "User created successfully"})
 }
 
 func loginHandler(c *gin.Context) {
@@ -98,25 +105,31 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Generate OTP and send it to the user's email or phone (tbd)
-	otp, err := generateAndSendOTP(user.Email, user.Phone)
+	if user.TOTPKey == "" {
+		key, err := generateTOTPKey(user.Email)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate TOTP key"})
+			return
+		}
+		user.TOTPKey = key
+		if err := db.Save(&user).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save TOTP key"})
+			return
+		}
+	}
+
+	otp, err := generateTOTP(user.TOTPKey)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate OTP"})
 		return
 	}
 
-	// Temporarily save otp to users record.
-	user.OTPKey = otp
-	db.Save(&user)
+	if err := sendOTP(user.Email, user.Phone, otp); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send OTP"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "OTP sent to your email/phone"})
-}
-
-func logoutHandler(c *gin.Context) {
-	token := c.GetHeader("Authorization")
-	db.Where("token = ?", token).Delete(&Session{})
-	logActivity(c.GetUint("user_id"), "Logout")
-	c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
 }
 
 func verifyOTPHandler(c *gin.Context) {
@@ -136,43 +149,78 @@ func verifyOTPHandler(c *gin.Context) {
 		return
 	}
 
-	if !totp.Validate(otpData.OTPCode, user.OTPKey) {
+	if !totp.Validate(otpData.OTPCode, user.TOTPKey) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
 		return
 	}
-	//clear the temp otp.
-	user.OTPKey = ""
-	db.Save(&user)
 
 	token := generateToken()
-	session := Session{UserID: user.ID, Token: token}
+	expiryTime := time.Now().Add(24 * time.Hour)
+	session := Session{UserID: user.ID, Token: token, Expiry: expiryTime}
 	db.Create(&session)
 
 	logActivity(user.ID, "Login")
 
-	c.JSON(http.StatusOK, gin.H{"message": "OTP verified", "token": token})
+	c.JSON(http.StatusOK, gin.H{"message": "Login successful", "token": token})
 }
 
+func logoutHandler(c *gin.Context) {
+	token := c.GetHeader("Authorization")
+	db.Where("token = ?", token).Delete(&Session{})
+	logActivity(c.GetUint("user_id"), "Logout")
+	c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
+}
+
+// Logs all activity accessed through /protected endpoint
+func protectedHandler(c *gin.Context) {
+	userID := c.GetUint("user_id")
+	var user User
+	db.First(&user, userID)
+	logActivity(userID, "Accessed protected resource")
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Hello, %s! Your role is %s", user.Username, user.Role)})
+}
+
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("Authorization")
+		var session Session
+		if err := db.Where("token = ? AND expiry > ?", token, time.Now()).First(&session).Error; err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
+			c.Abort()
+			return
+		}
+		c.Set("user_id", session.UserID)
+		c.Next()
+	}
+}
+
+// Generates a token that has a lifespan of the session, it adds weight to the authmiddleware lol
 func generateToken() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base32.StdEncoding.EncodeToString(b)
 }
 
-func generateAndSendOTP(email, phone string) (string, error) {
+func generateTOTPKey(account_identifier string) (string, error) {
 	key, err := totp.Generate(totp.GenerateOpts{
-		Issuer:      "AdityasCompany",
-		AccountName: email + phone,
+		Issuer:      "TheCompanyNameGoesHere",
+		AccountName: account_identifier,
+		Algorithm:   otp.AlgorithmSHA256,
 	})
 	if err != nil {
 		return "", err
 	}
+	return key.Secret(), nil
+}
 
-	otp := key.Secret()
-	// Actual  OTP sending functionality TBD.
-	fmt.Printf("Sending OTP %s to email %s or phone %s\n", otp, email, phone)
+func generateTOTP(key string) (string, error) {
+	return totp.GenerateCode(key, time.Now())
+}
 
-	return otp, nil
+func sendOTP(email, phone, otp string) error {
+	// Email and sms service yet to be integrated here
+	log.Printf("Sending OTP %s to email %s or phone %s\n", otp, email, phone)
+	return nil
 }
 
 func logActivity(userID uint, action string) {
