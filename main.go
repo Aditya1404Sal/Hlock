@@ -226,3 +226,6 @@ func sendOTP(email, phone, otp string) error {
 func logActivity(userID uint, action string) {
 	db.Create(&ActivityLog{UserID: userID, Action: action})
 }
+
+// TODO : write the SAML implementation for the SSO support
+// Will need 3rd party access as well as multiple test cases
